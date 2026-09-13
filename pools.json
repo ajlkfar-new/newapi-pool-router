@@ -12,5 +12,11 @@
     "glm-4.7-flash",
     "glm-4.5-flash",
     "glm-4-flash"
+  ],
+  "st-free": [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-5.2",
+    "sensenova-6.8-flash-lite"
   ]
 }
