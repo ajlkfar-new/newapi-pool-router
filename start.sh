@@ -16,6 +16,27 @@
 
 cd /data
 
+# ============================================================================
+# 抗闪退加固（用一次模型后偶发退出）
+#
+# 根因（按可能性排序）：
+#   1) 连接池过大：new-api 默认 SQL_MAX_OPEN_CONNS=1000 / IDLE=100，远超 Neon
+#      免费层连接上限。一旦写请求日志/扣费（即"用过一次模型"）就会把 Neon 连接
+#      打满，导致查询报错、进程异常退出。→ 直接压到 10/5。
+#   2) 内存 OOM：Render 免费层 512MB，Go(new-api) + Python(uvicorn) 双进程共享，
+#      Go 默认 GC 目标会一路吃掉内存。→ GOMEMLIMIT 给 Go 一个软上限。
+#   3) 冷启 502 被误判为"闪退"（Neon/Render 双重休眠，十几秒属正常）。
+#
+# 写法说明：全部用 ${VAR:-默认值}，即"Render 环境变量面板里设了就以面板为准"，
+# 没设才用这里的保守默认值。所以不必去面板改，也能立刻生效；需要调整时再在面板覆盖。
+# ============================================================================
+export SQL_MAX_OPEN_CONNS="${SQL_MAX_OPEN_CONNS:-10}"
+export SQL_MAX_IDLE_CONNS="${SQL_MAX_IDLE_CONNS:-5}"
+export SQL_MAX_LIFETIME="${SQL_MAX_LIFETIME:-60}"
+export GOMEMLIMIT="${GOMEMLIMIT:-300MiB}"
+export ERROR_LOG_ENABLED="${ERROR_LOG_ENABLED:-true}"
+echo "[start.sh] hardening: OPEN_CONNS=$SQL_MAX_OPEN_CONNS IDLE=$SQL_MAX_IDLE_CONNS LIFETIME=${SQL_MAX_LIFETIME}s GOMEMLIMIT=$GOMEMLIMIT"
+
 # 从 SQL_DSN 解析数据库主机:端口（Neon 为 postgres://user:pass@host:5432/db）
 DB_HOST=""
 DB_PORT="5432"
