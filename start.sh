@@ -37,6 +37,27 @@ export GOMEMLIMIT="${GOMEMLIMIT:-300MiB}"
 export ERROR_LOG_ENABLED="${ERROR_LOG_ENABLED:-true}"
 echo "[start.sh] hardening: OPEN_CONNS=$SQL_MAX_OPEN_CONNS IDLE=$SQL_MAX_IDLE_CONNS LIFETIME=${SQL_MAX_LIFETIME}s GOMEMLIMIT=$GOMEMLIMIT"
 
+# ============================================================================
+# 登录会话上限（修 "活跃登录会话数已达上限"）
+#
+# 现象：登录被拒，提示"活跃登录会话数已达上限，请在已登录设备上撤销其他会话…"。
+#
+# 源码定案（common/init.go:142 + service/auth_session.go:79）：
+#   common.UserSessionActiveLimit 直接取自 env，默认 50（common/constants.go:41）；
+#   登录时判定 activeCount >= UserSessionActiveLimit 即拒绝。
+#   全仓不存在"按 SQL 连接池大小钳制会话上限"的逻辑 —— 与上面的连接池加固无关。
+#
+# 真实原因：本实例 Session 持久化在 Neon Postgres，会跨重启/休眠累积；单账号在多设备、
+#   隐身窗口反复登录，day 级累积就撞到 50。
+#
+# 处置：
+#   1) 把上限提到 200 —— 单账号自用足够宽松（每行 session 很小，200 行对 Neon 无压力）。
+#   2) 缩短单会话有效期到 7 天，让闲置会话自然过期、不再无限堆积（默认见 SESSION_TTL 相关逻辑）。
+#   3) 若某次仍撞上限，逃生通道仍是"重置密码"（撤销所有会话）。
+# ============================================================================
+export USER_SESSION_ACTIVE_LIMIT="${USER_SESSION_ACTIVE_LIMIT:-200}"
+echo "[start.sh] session: ACTIVE_LIMIT=$USER_SESSION_ACTIVE_LIMIT"
+
 # 从 SQL_DSN 解析数据库主机:端口（Neon 为 postgres://user:pass@host:5432/db）
 DB_HOST=""
 DB_PORT="5432"
