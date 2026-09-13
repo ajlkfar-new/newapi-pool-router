@@ -52,8 +52,10 @@ echo "[start.sh] hardening: OPEN_CONNS=$SQL_MAX_OPEN_CONNS IDLE=$SQL_MAX_IDLE_CO
 #
 # 处置：
 #   1) 把上限提到 200 —— 单账号自用足够宽松（每行 session 很小，200 行对 Neon 无压力）。
-#   2) 缩短单会话有效期到 7 天，让闲置会话自然过期、不再无限堆积（默认见 SESSION_TTL 相关逻辑）。
-#   3) 若某次仍撞上限，逃生通道仍是"重置密码"（撤销所有会话）。
+#   2) 若某次仍撞上限，逃生通道仍是"重置密码"（撤销所有会话）。
+#
+# 注：会话行会随活跃数上升而累积，但到期会话由 new-api 自身的清理任务回收
+#     （model/user_session.go 的 cleanup 逻辑），无需在此额外处理。
 # ============================================================================
 export USER_SESSION_ACTIVE_LIMIT="${USER_SESSION_ACTIVE_LIMIT:-200}"
 echo "[start.sh] session: ACTIVE_LIMIT=$USER_SESSION_ACTIVE_LIMIT"
