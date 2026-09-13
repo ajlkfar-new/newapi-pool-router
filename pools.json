@@ -1,0 +1,22 @@
+{
+  "_说明": "键=客户端使用的统一模型名(池别名)；值=New API 里已配置的真实模型名列表(按顺序尝试，前一个失败自动换下一个)。",
+  "free": [
+    "agnes-1",
+    "agnes-2",
+    "agnes-3",
+    "agnes-4",
+    "agnes-5",
+    "agnes-6",
+    "ocg-model-a",
+    "ocg-model-b",
+    "ocg-model-c"
+  ],
+  "coder": [
+    "ocg-coder-1",
+    "agnes-2"
+  ],
+  "smart": [
+    "ocg-smart-1",
+    "agnes-1"
+  ]
+}
