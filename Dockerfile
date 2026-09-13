@@ -9,7 +9,7 @@ RUN apt-get update \
 
 WORKDIR /pool
 COPY requirements.txt /pool/requirements.txt
-RUN pip3 install --no-cache-dir -r /pool/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /pool/requirements.txt
 
 COPY pool_router.py /pool/pool_router.py
 COPY pools.json /pool/pools.json
