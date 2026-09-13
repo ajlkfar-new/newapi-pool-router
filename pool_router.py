@@ -25,6 +25,20 @@ POOL_CONFIG_PATH = os.environ.get("POOL_CONFIG", "/pool/pools.json")
 
 app = FastAPI()
 
+# 需要剥离的逐跳/长度相关头，避免转发后长度不匹配
+HOP_HEADERS = {
+    "transfer-encoding",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "upgrade",
+    "host",
+}
+
 
 def load_pools():
     try:
@@ -35,6 +49,27 @@ def load_pools():
 
 
 POOLS = load_pools()
+
+
+def _new_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0, connect=15.0),
+        follow_redirects=False,
+    )
+
+
+async def _open_stream(client: httpx.AsyncClient, method: str, url: str, **kw):
+    """正确地以流式方式发起上游请求。
+
+    注意：httpx 的 client.stream() 返回的是异步上下文管理器，不能被 await。
+    这里用 build_request + send(stream=True)，两者都是可 await 的。
+    """
+    req = client.build_request(method, url, **kw)
+    return await client.send(req, stream=True)
+
+
+def _strip_hop_headers(headers):
+    return {k: v for k, v in headers.items() if k.lower() not in HOP_HEADERS}
 
 
 @app.get("/healthz")
@@ -57,14 +92,6 @@ async def list_models():
         if not name.startswith("_")
     ]
     return {"object": "list", "data": data}
-
-
-def _strip_hop_headers(headers):
-    return {
-        k: v
-        for k, v in headers.items()
-        if k.lower() not in ("transfer-encoding", "content-length", "connection")
-    }
 
 
 @app.api_route("/v1/chat/completions", methods=["POST"])
@@ -92,10 +119,11 @@ async def chat_completions(request: Request):
             "Authorization": f"Bearer {NEW_API_TOKEN}",
             "Content-Type": "application/json",
         }
-        client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+        client = _new_client()
         try:
             if stream:
-                upstream = await client.stream(
+                upstream = await _open_stream(
+                    client,
                     "POST",
                     f"{NEW_API_BASE}/v1/chat/completions",
                     json=attempt,
@@ -125,25 +153,28 @@ async def chat_completions(request: Request):
                         "X-Accel-Buffering": "no",
                     },
                 )
-            else:
-                resp = await client.post(
-                    f"{NEW_API_BASE}/v1/chat/completions",
-                    json=attempt,
-                    headers=headers,
-                )
+
+            resp = await client.post(
+                f"{NEW_API_BASE}/v1/chat/completions",
+                json=attempt,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                last_err = (resp.status_code, resp.content)
                 await client.aclose()
-                if resp.status_code != 200:
-                    last_err = (resp.status_code, resp.content)
-                    continue
-                return Response(
-                    content=resp.content,
-                    status_code=200,
-                    media_type="application/json",
-                    headers=_strip_hop_headers(resp.headers),
-                )
+                continue
+            content = resp.content
+            resp_headers = _strip_hop_headers(resp.headers)
+            await client.aclose()
+            return Response(
+                content=content,
+                status_code=200,
+                media_type=resp.headers.get("content-type", "application/json"),
+                headers=resp_headers,
+            )
         except Exception as e:
             await client.aclose()
-            last_err = (502, str(e).encode())
+            last_err = (502, json.dumps({"error": {"message": f"upstream error: {e}"}}).encode())
             continue
 
     code = last_err[0] if last_err else 502
@@ -163,32 +194,18 @@ async def proxy_all(request: Request, full_path: str):
     headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
+        if k.lower() not in HOP_HEADERS
     }
     body = await request.body()
-    client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+    client = _new_client()
     try:
-        upstream = await client.stream(
+        upstream = await _open_stream(
+            client,
             request.method,
             target,
             params=request.query_params,
             content=body,
             headers=headers,
-        )
-
-        async def gen(client=client, upstream=upstream):
-            try:
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
-
-        return StreamingResponse(
-            gen(),
-            status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type"),
-            headers=_strip_hop_headers(upstream.headers),
         )
     except Exception as e:
         await client.aclose()
@@ -197,6 +214,21 @@ async def proxy_all(request: Request, full_path: str):
             status_code=502,
             media_type="application/json",
         )
+
+    async def gen(client=client, upstream=upstream):
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        gen(),
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+        headers=_strip_hop_headers(upstream.headers),
+    )
 
 
 if __name__ == "__main__":
