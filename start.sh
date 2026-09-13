@@ -53,12 +53,28 @@ echo "[start.sh] hardening: OPEN_CONNS=$SQL_MAX_OPEN_CONNS IDLE=$SQL_MAX_IDLE_CO
 # 处置：
 #   1) 把上限提到 200 —— 单账号自用足够宽松（每行 session 很小，200 行对 Neon 无压力）。
 #   2) 若某次仍撞上限，逃生通道仍是"重置密码"（撤销所有会话）。
-#
-# 注：会话行会随活跃数上升而累积，但到期会话由 new-api 自身的清理任务回收
-#     （model/user_session.go 的 cleanup 逻辑），无需在此额外处理。
+#   3) 长期闲置会话由本脚本的 prune_sessions.py 定期清理（见下方"闲置会话清理"段）。
 # ============================================================================
 export USER_SESSION_ACTIVE_LIMIT="${USER_SESSION_ACTIVE_LIMIT:-200}"
 echo "[start.sh] session: ACTIVE_LIMIT=$USER_SESSION_ACTIVE_LIMIT"
+
+# ============================================================================
+# 闲置会话清理（补 new-api 自身清理能力的缺口）
+#
+# 上游自带清理（service/auth_cleanup.go）：每小时跑一次，但只删
+#   DeleteExpiredUserSessions —— 条件是 `expires_at < now`，即**只删已过期**的会话。
+# 而 LoginSessionTTL = 30 天（service/auth_token.go:22）——所以"登录过但长期没用"
+#   的会话在 30 天内都不会被回收，会一直占着 active 名额。这正是撞上限的成因。
+#
+# 本段启动一个后台循环，每 SESSION_PRUNE_INTERVAL 秒调用 prune_sessions.py，
+#   删除 last_active_at 超过 SESSION_IDLE_DAYS 天的**活跃**会话：
+#     - 单用户实例（只有你一个人用），不会被误伤。
+#     - 只删闲置的，最近用过的会话一律保留，不会把你踢下线。
+#     - 若 New API 自行加了 SESSION_IDLE_DAYS 等环境变量，以 New API 为准，本脚本自动退让。
+# ============================================================================
+SESSION_IDLE_DAYS="${SESSION_IDLE_DAYS:-14}"
+SESSION_PRUNE_INTERVAL="${SESSION_PRUNE_INTERVAL:-86400}"
+echo "[start.sh] session prune: IDLE_DAYS=$SESSION_IDLE_DAYS INTERVAL=${SESSION_PRUNE_INTERVAL}s"
 
 # 从 SQL_DSN 解析数据库主机:端口（Neon 为 postgres://user:pass@host:5432/db）
 DB_HOST=""
@@ -97,6 +113,31 @@ fi
     wait "$NA_PID" 2>/dev/null
     echo "[start.sh] new-api exited, restart in 3s"
     sleep 3
+  done
+) &
+
+# 闲置会话清理循环（详见上方"闲置会话清理"段）
+#
+# 注意：Render 免费层会休眠，进程重启后计时器归零。若只写 "sleep 24h 再跑"，
+# 在频繁休眠的实例上可能**永远跑不到**。因此这里改为：先等 New API 就绪，
+# 立刻执行一次（让部署后几分钟内就能在日志里看到结果），再进入周期循环。
+(
+  mkdir -p /data/logs
+  # 等 New API 监听 3000（最多 120s），确保它的表结构已就绪
+  j=0
+  while [ $j -lt 120 ]; do
+    python3 -c "import socket; socket.create_connection(('127.0.0.1', 3000), 1)" 2>/dev/null && break
+    sleep 2
+    j=$((j + 2))
+  done
+  echo "[start.sh] running initial session prune at $(date)"
+  python3 /pool/prune_sessions.py >> /data/logs/session_prune.log 2>&1 \
+    || echo "[start.sh] initial prune failed (see /data/logs/session_prune.log)"
+  while true; do
+    sleep "$SESSION_PRUNE_INTERVAL"
+    echo "[start.sh] pruning idle sessions at $(date)"
+    python3 /pool/prune_sessions.py >> /data/logs/session_prune.log 2>&1 \
+      || echo "[start.sh] prune failed (see /data/logs/session_prune.log)"
   done
 ) &
 

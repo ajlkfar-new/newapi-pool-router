@@ -15,6 +15,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /pool/requirements.tx
 
 COPY pool_router.py /pool/pool_router.py
 COPY pools.json /pool/pools.json
+COPY prune_sessions.py /pool/prune_sessions.py
 COPY start.sh /pool/start.sh
 RUN chmod +x /pool/start.sh
 
