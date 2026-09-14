@@ -9,9 +9,9 @@
     "agnes-2.0-flash"
   ],
   "glm-free": [
+    "glm-4-flash",
     "glm-4.7-flash",
-    "glm-4.5-flash",
-    "glm-4-flash"
+    "glm-4.5-flash"
   ],
   "st-free": [
     "deepseek-v4-flash",
