@@ -26,8 +26,14 @@ cd /data
 #
 # 改这里时记得同步 git commit，否则标记会骗人。
 # ============================================================================
-APP_REV="2026-09-14-prune-off"
+APP_REV="2026-09-15-auth-secret"
 export APP_REV
+
+# 容器启动时刻（unix 秒）。与 new-api 自己的 /api/status.start_time 对比即可判断重启性质：
+#   两者接近（几秒内）  -> 整个容器重启（Render 冷启 / 重新部署）
+#   start_time 明显更晚 -> 只是 new-api 进程被看门狗重启（崩溃 / 卡连库）
+BOOT_TS="$(date -u +%s)"
+export BOOT_TS
 
 # ============================================================================
 # 抗闪退加固（用一次模型后偶发退出）
@@ -70,6 +76,47 @@ echo "[start.sh] hardening: OPEN_CONNS=$SQL_MAX_OPEN_CONNS IDLE=$SQL_MAX_IDLE_CO
 # ============================================================================
 export USER_SESSION_ACTIVE_LIMIT="${USER_SESSION_ACTIVE_LIMIT:-200}"
 echo "[start.sh] session: ACTIVE_LIMIT=$USER_SESSION_ACTIVE_LIMIT"
+
+# ============================================================================
+# 认证密钥稳定性（修 "会话已过期！" / 频繁被要求重新登录）
+#
+# 现象：网页后台隔一段时间就弹"会话已过期！"并跳回登录页；API Key 调用完全不受影响。
+#
+# 源码定案（上游 main 分支，逐行读过）：
+#   common/constants.go:35   var SessionSecret = uuid.New().String()
+#   common/init.go:50        仅当 SESSION_SECRET 环境变量存在时才覆盖它
+#   service/auth_token.go:55 authSigningKey() 以 SessionSecret 为 HMAC 密钥，
+#                            用于签发/校验 access token（HS256 JWT，TTL 15 分钟）
+#   service/auth_session.go:430 hashRefreshSecret() 同样派生自 SessionSecret，
+#                            其输出**存进 user_sessions 表**作为刷新令牌的校验值
+#   web/src/lib/http-client.ts:117  刷新失败 -> Toast "Session expired!" -> 跳登录页
+#
+# 结论：不设 SESSION_SECRET 时，它是**每次进程启动随机生成**的 UUID。于是每次 new-api
+#   重启（Render 免费层冷启 / 重新部署 / 进程崩溃被看门狗重启），旧 access token 验签
+#   失败、refresh token 的哈希也匹配不上库里的记录 -> 刷新失败 -> 被迫重新登录。
+#   免费层只要电脑休眠超过 15 分钟就会被回收，所以感觉"没一会儿就要重登"。
+#
+# 处置：提供一个**跨重启、跨部署都稳定**的 SESSION_SECRET。
+#   优先级：Render 环境变量面板的 SESSION_SECRET > 本段派生的稳定值。
+#   派生方式：sha256(SQL_DSN)。SQL_DSN 本身就是密钥、且长期不变，因此既不把明文密钥
+#   写进仓库（仓库若公开也不至于被人伪造后台令牌），又能保证每次启动得到同一个值。
+#   若连 SQL_DSN 都没有，则只告警、不设置，保持上游行为（避免引入一个可从仓库推出的弱密钥）。
+#
+# 注意：切换密钥这一次会让**当前已登录的会话失效一次**，重新登录即可；此后不再频繁掉线。
+# ============================================================================
+AUTH_SECRET_SOURCE="none"
+if [ -n "$SESSION_SECRET" ]; then
+  AUTH_SECRET_SOURCE="env"
+  echo "[start.sh] SESSION_SECRET from env (stable)"
+elif [ -n "$SQL_DSN" ]; then
+  SESSION_SECRET="$(python3 -c 'import hashlib,os;print(hashlib.sha256(("new-api/auth-secret/v1:"+os.environ.get("SQL_DSN","")).encode("utf-8")).hexdigest())')"
+  export SESSION_SECRET
+  AUTH_SECRET_SOURCE="derived"
+  echo "[start.sh] SESSION_SECRET derived from SQL_DSN (stable across restarts)"
+else
+  echo "[start.sh] WARNING: SESSION_SECRET unset and SQL_DSN missing; web sessions WILL be invalidated on every restart. Set SESSION_SECRET in the Render env panel."
+fi
+export AUTH_SECRET_SOURCE
 
 # ============================================================================
 # 闲置会话清理（默认关闭；需要时用 SESSION_PRUNE_ENABLED=1 打开）

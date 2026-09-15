@@ -19,6 +19,7 @@
 """
 import os
 import json
+import time
 import hmac
 import hashlib
 import httpx
@@ -29,6 +30,29 @@ NEW_API_BASE = os.environ.get("NEW_API_BASE", "http://localhost:3000").rstrip("/
 NEW_API_TOKEN = os.environ.get("NEW_API_TOKEN", "")
 POOL_CONFIG_PATH = os.environ.get("POOL_CONFIG", "/pool/pools.json")
 POOLS_ADMIN_TOKEN = os.environ.get("POOLS_ADMIN_TOKEN", "")
+
+# ---------------------------------------------------------------- 认证密钥诊断
+# 背景：new-api 的 SESSION_SECRET 默认是"每次进程启动随机生成"的 UUID
+# (common/constants.go:35 -> var SessionSecret = uuid.New().String())，
+# 而 access token 的签名密钥与 refresh token 的校验哈希都由它派生
+# (service/auth_token.go:55 / service/auth_session.go:430)。于是**每次重启都会
+# 让已登录会话失效**，前端刷新失败后弹"会话已过期！"并跳登录页。
+# start.sh 现在会派生一个跨重启稳定的值(见那里的详注)。这里只做**可观测**：
+#   auth_secret_source：密钥来源。env=面板显式设置；derived=由 SQL_DSN 派生；
+#                       none=没有(上游随机行为，重启即失效)。
+#   auth_secret_fp    ：稳定值的 12 位指纹(sha256 前缀，不可逆、不可用于伪造令牌)。
+#                       服务重启前后指纹相同，即可**直接证明**密钥稳定、会话不再被重启清掉。
+AUTH_SECRET = os.environ.get("SESSION_SECRET", "")
+AUTH_SECRET_SOURCE = os.environ.get("AUTH_SECRET_SOURCE", "") or ("env" if AUTH_SECRET else "none")
+AUTH_SECRET_FP = (
+    hashlib.sha256(("new-api/auth-secret-fp/v1:" + AUTH_SECRET).encode("utf-8")).hexdigest()[:12]
+    if AUTH_SECRET
+    else ""
+)
+# 容器(启动脚本)启动时刻；与 new-api 的 start_time 对比可区分"整容器重启"与"仅 new-api 进程重启"。
+BOOT_TS = int(os.environ.get("BOOT_TS", "0") or "0")
+# 本路由进程的启动时刻，用于判断路由器自己是否被重启过。
+ROUTER_STARTED_AT = int(time.time())
 
 app = FastAPI()
 
@@ -181,6 +205,11 @@ async def health():
         "pools": list(POOLS.keys()),
         # 会话清理是这套部署里唯一会用 DELETE 动数据的组件，它是否在跑必须可见。
         "session_prune_enabled": os.environ.get("SESSION_PRUNE_ENABLED", "0") == "1",
+        # 重启排查用的时间锚点与认证密钥诊断(详见文件顶部注释)
+        "boot_ts": BOOT_TS,
+        "router_started_at": ROUTER_STARTED_AT,
+        "auth_secret_source": AUTH_SECRET_SOURCE,
+        "auth_secret_fp": AUTH_SECRET_FP,
     }
 
 
