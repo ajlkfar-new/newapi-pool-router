@@ -5,8 +5,9 @@
   1. 客户端只需配置一个池别名(如 free)，本层按 pools.json 的顺序，
      把请求转发给 New API(内部 3000) 上对应的真实模型名；前一个失败自动换下一个。
   2. /v1/models 只返回池别名 -> 客户端下拉里不再出现一长串模型。
-  3. /healthz 汇报配置是否加载成功 + 池数量 + 配置指纹；/pools 只读回显完整映射
-     (需 Bearer 令牌)。这两个端点用于确认"部署是否真的生效、顺序到底是什么"。
+  3. /healthz 汇报配置是否加载成功 + 池数量 + 配置指纹 + 部署版本标记(APP_REV) +
+     会话清理开关状态；/pools 只读回显完整映射(需 Bearer 令牌)。这几个端点用于确认
+     "部署是否真的生效、顺序到底是什么、有没有组件在动数据库"。
   4. 其余路径(后台 UI、/api/* 等)原样反向代理到 New API，后台管理照常可用。
 
 环境变量：
@@ -172,11 +173,14 @@ async def health():
     """
     return {
         "status": "ok" if POOLS_OK else "degraded",
+        "rev": os.environ.get("APP_REV", ""),
         "config_ok": POOLS_OK,
         "config_detail": POOLS_DETAIL,
         "config_sha": POOLS_DIGEST,
         "pools_count": len(POOLS),
         "pools": list(POOLS.keys()),
+        # 会话清理是这套部署里唯一会用 DELETE 动数据的组件，它是否在跑必须可见。
+        "session_prune_enabled": os.environ.get("SESSION_PRUNE_ENABLED", "0") == "1",
     }
 
 

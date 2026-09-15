@@ -74,8 +74,10 @@ def main() -> int:
 
             cutoff = int(datetime.now(timezone.utc).timestamp()) - IDLE_DAYS * 86400
 
-            where = [f'"{last_col}" < %s']
-            params: list[object] = [cutoff]
+            # 时间戳 <= 0 是"未知"，不是"很旧"：上游对这种行也是当作待修正
+            # （model/user_session.go:155 把 0 补成 now）。绝不能判成闲置，否则误删。
+            where = [f'"{last_col}" > %s', f'"{last_col}" < %s']
+            params: list[object] = [0, cutoff]
             if status_col:
                 where.append(f'"{status_col}" = %s')
                 params.append("active")

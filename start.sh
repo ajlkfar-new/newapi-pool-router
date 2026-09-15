@@ -17,6 +17,19 @@
 cd /data
 
 # ============================================================================
+# 部署版本标记（APP_REV）
+#
+# 用途：Render 的 /api/status.version 恒为镜像标签（如 v1.0.0-rc.37），没有区分度，
+# 导致"这次 push 到底上线了没有"只能靠 start_time 时间相关性去猜。改这个标记并让
+# pool_router 在 /healthz 里回显它，就能对 start.sh 这类非 pool_router 改动做**直接**
+# 验证：curl /healthz 看 rev 是否等于本次提交写入的值即可。
+#
+# 改这里时记得同步 git commit，否则标记会骗人。
+# ============================================================================
+APP_REV="2026-09-14-prune-off"
+export APP_REV
+
+# ============================================================================
 # 抗闪退加固（用一次模型后偶发退出）
 #
 # 根因（按可能性排序）：
@@ -59,22 +72,31 @@ export USER_SESSION_ACTIVE_LIMIT="${USER_SESSION_ACTIVE_LIMIT:-200}"
 echo "[start.sh] session: ACTIVE_LIMIT=$USER_SESSION_ACTIVE_LIMIT"
 
 # ============================================================================
-# 闲置会话清理（补 new-api 自身清理能力的缺口）
+# 闲置会话清理（默认关闭；需要时用 SESSION_PRUNE_ENABLED=1 打开）
 #
-# 上游自带清理（service/auth_cleanup.go）：每小时跑一次，但只删
-#   DeleteExpiredUserSessions —— 条件是 `expires_at < now`，即**只删已过期**的会话。
-# 而 LoginSessionTTL = 30 天（service/auth_token.go:22）——所以"登录过但长期没用"
-#   的会话在 30 天内都不会被回收，会一直占着 active 名额。这正是撞上限的成因。
+# 背景：上游自带清理（service/auth_cleanup.go）每小时跑一次，但只删
+#   `expires_at < now` 的**已过期**会话；而 LoginSessionTTL = 30 天
+#   （service/auth_token.go:22），所以"登录过但长期没用"的会话会一直占 active 名额。
+#   本脚本原本用来补这个缺口：删 last_active_at 早于 N 天的活跃会话。
 #
-# 本段启动一个后台循环，每 SESSION_PRUNE_INTERVAL 秒调用 prune_sessions.py，
-#   删除 last_active_at 超过 SESSION_IDLE_DAYS 天的**活跃**会话：
-#     - 单用户实例（只有你一个人用），不会被误伤。
-#     - 只删闲置的，最近用过的会话一律保留，不会把你踢下线。
-#     - 若 New API 自行加了 SESSION_IDLE_DAYS 等环境变量，以 New API 为准，本脚本自动退让。
+# 2026-09-14 改为**默认关闭**，原因（用户反馈"频繁被要求重新登录"）：
+#   1) 它是这套部署里**唯一会用 DELETE 动数据库**的组件，风险与收益不成比例。
+#   2) 上游 last_active_at 的语义比想象的弱：它只在**建会话时**
+#      （model/user_session.go:155）和**refresh-token 轮换时**（同文件 ~488 行）
+#      写入。若某会话长期只用 API、浏览器不做 token 轮换，该字段会长期停在旧值，
+#      于是"其实还活着"的会话会被判成闲置 → 误删 → 强制重新登录。
+#   3) 冗余：会话上限已提到 200（见上），单账号自用完全够，本不需要自动回收。
+#   4) 位置不对：它在**每次容器启动**都跑一次，而免费层每次冷启（PC 休眠后回来）
+#      都会触发容器重启 → 潜在误删被放大成"每次回来都要重新登录"。
+#
+# 打开方式：在 Render 环境变量面板设 SESSION_PRUNE_ENABLED=1（或在下面改默认值）。
+#   若打开，prune_sessions.py 现在还会跳过 last_active_at <= 0 的"时间戳未知"行。
 # ============================================================================
+SESSION_PRUNE_ENABLED="${SESSION_PRUNE_ENABLED:-0}"
 SESSION_IDLE_DAYS="${SESSION_IDLE_DAYS:-14}"
 SESSION_PRUNE_INTERVAL="${SESSION_PRUNE_INTERVAL:-86400}"
-echo "[start.sh] session prune: IDLE_DAYS=$SESSION_IDLE_DAYS INTERVAL=${SESSION_PRUNE_INTERVAL}s"
+export SESSION_PRUNE_ENABLED
+echo "[start.sh] session prune: ENABLED=$SESSION_PRUNE_ENABLED IDLE_DAYS=$SESSION_IDLE_DAYS INTERVAL=${SESSION_PRUNE_INTERVAL}s"
 
 # 从 SQL_DSN 解析数据库主机:端口（Neon 为 postgres://user:pass@host:5432/db）
 DB_HOST=""
@@ -116,30 +138,34 @@ fi
   done
 ) &
 
-# 闲置会话清理循环（详见上方"闲置会话清理"段）
+# 闲置会话清理循环（默认不跑；详见上方"闲置会话清理"段）
 #
 # 注意：Render 免费层会休眠，进程重启后计时器归零。若只写 "sleep 24h 再跑"，
 # 在频繁休眠的实例上可能**永远跑不到**。因此这里改为：先等 New API 就绪，
 # 立刻执行一次（让部署后几分钟内就能在日志里看到结果），再进入周期循环。
-(
-  mkdir -p /data/logs
-  # 等 New API 监听 3000（最多 120s），确保它的表结构已就绪
-  j=0
-  while [ $j -lt 120 ]; do
-    python3 -c "import socket; socket.create_connection(('127.0.0.1', 3000), 1)" 2>/dev/null && break
-    sleep 2
-    j=$((j + 2))
-  done
-  echo "[start.sh] running initial session prune at $(date)"
-  python3 /pool/prune_sessions.py >> /data/logs/session_prune.log 2>&1 \
-    || echo "[start.sh] initial prune failed (see /data/logs/session_prune.log)"
-  while true; do
-    sleep "$SESSION_PRUNE_INTERVAL"
-    echo "[start.sh] pruning idle sessions at $(date)"
+if [ "$SESSION_PRUNE_ENABLED" = "1" ]; then
+  (
+    mkdir -p /data/logs
+    # 等 New API 监听 3000（最多 120s），确保它的表结构已就绪
+    j=0
+    while [ $j -lt 120 ]; do
+      python3 -c "import socket; socket.create_connection(('127.0.0.1', 3000), 1)" 2>/dev/null && break
+      sleep 2
+      j=$((j + 2))
+    done
+    echo "[start.sh] running initial session prune at $(date)"
     python3 /pool/prune_sessions.py >> /data/logs/session_prune.log 2>&1 \
-      || echo "[start.sh] prune failed (see /data/logs/session_prune.log)"
-  done
-) &
+      || echo "[start.sh] initial prune failed (see /data/logs/session_prune.log)"
+    while true; do
+      sleep "$SESSION_PRUNE_INTERVAL"
+      echo "[start.sh] pruning idle sessions at $(date)"
+      python3 /pool/prune_sessions.py >> /data/logs/session_prune.log 2>&1 \
+        || echo "[start.sh] prune failed (see /data/logs/session_prune.log)"
+    done
+  ) &
+else
+  echo "[start.sh] session prune disabled (SESSION_PRUNE_ENABLED=$SESSION_PRUNE_ENABLED), skipping"
+fi
 
 # 给 New API 启动时间（免费层 + Neon 冷启都慢）
 sleep 8
